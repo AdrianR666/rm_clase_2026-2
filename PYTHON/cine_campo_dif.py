@@ -4,18 +4,19 @@ import numpy as np
 import socket
 
 # ================= UDP =================
-UDP_IP = "192.168.137.224"
+UDP_IP = "192.168.137.115"
 UDP_PORT = 12345
 udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # ================= ArUco =================
 MARKER_SIZE_METERS = 0.1
+MARKER_IDS = [0, 1, 2]  # 0 = referencia, 1 = robot, 2 = objetivo
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 parameters = aruco.DetectorParameters()
 detector = aruco.ArucoDetector(aruco_dict, parameters)
 
 # ================= Cámara =================
-cap = cv.VideoCapture(1, cv.CAP_DSHOW)
+cap = cv.VideoCapture(0, cv.CAP_DSHOW)
 
 camera_params = [1999.17838, 2006.06097, 928.811574, 478.347147]
 camera_matrix = np.array([
@@ -27,13 +28,15 @@ camera_matrix = np.array([
 dist_coeffs = np.array([0.0906, 0.3189, -0.0028, 0.00018, -2.998])
 
 # ================= Robot =================
-r_rueda = 0.03       # radio rueda [m]
-l_eje = 0.12         # distancia entre ruedas [m]
+r_rueda = 0.03
+l_eje = 0.12
 
-# ===== Reaching the goal + campo atractivo =====
-v_max = 0.25         # [m/s]
-w_max = 2.5          # [rad/s]
-k_r = 0.15           # radio docking [m]
+# ===== Campos potenciales + reaching goal =====
+kv = 10        # ganancia lineal
+kw = 3.0        # ganancia angular
+v_max = 3    # [m/s]
+w_max = 1    # [rad/s]
+k_r = 0.15    # radio de docking [m]
 
 # ================= Funciones =================
 def obtener_matriz_homogenea(rvec, tvec):
@@ -63,10 +66,10 @@ def diferencial_inverse_kinematics(v, w, r, l):
     return vl, vr
 
 # ==========================================================
-# CONTROL UNIFICADO: CAMPO ATRACTIVO + REACHING THE GOAL
+# CAMPOS POTENCIALES ATRACTIVOS + REACHING GOAL
 # ==========================================================
-def control_reaching_goal(xr, yr, theta_r, xo, yo):
-    # Error en marco inercial {0}
+def control_potencial_reaching(xr, yr, theta_r, xo, yo):
+
     dx = xo - xr
     dy = yo - yr
     d = np.hypot(dx, dy)
@@ -78,16 +81,16 @@ def control_reaching_goal(xr, yr, theta_r, xo, yo):
         np.cos(theta_g - theta_r)
     )
 
-    # Velocidad lineal (reaching the goal)
+    # ---- Campo atractivo (lineal) ----
     if d > k_r:
-        v = v_max
+        v = kv * d
     else:
-        v = (v_max / k_r) * d
+        v = (kv * k_r) * (d / k_r)
 
-    # Velocidad angular
-    w = w_max * np.sin(theta_e)
+    # ---- Campo atractivo angular ----
+    w = kw * np.sin(theta_e)
 
-    # Saturación
+    # Saturaciones
     v = np.clip(v, 0.0, v_max)
     w = np.clip(w, -w_max, w_max)
 
@@ -118,7 +121,6 @@ while True:
 
         if all(k in poses for k in [0, 1, 2]):
 
-            # Transformaciones a marco inercial {0}
             T_cam_0 = obtener_matriz_homogenea(*poses[0])
             T_cam_1 = obtener_matriz_homogenea(*poses[1])
             T_cam_2 = obtener_matriz_homogenea(*poses[2])
@@ -126,21 +128,15 @@ while True:
             T_0_1 = transformar_a_referencia_0(T_cam_1, T_cam_0)
             T_0_2 = transformar_a_referencia_0(T_cam_2, T_cam_0)
 
-            # Posiciones en {0}
             xr, yr = T_0_1[0, 3], T_0_1[1, 3]
             xo, yo = T_0_2[0, 3], T_0_2[1, 3]
 
-            # Orientación del robot (yaw en {0})
             theta_r = np.arctan2(T_0_1[1, 0], T_0_1[0, 0])
 
             # ===== CONTROL =====
-            v, w = control_reaching_goal(xr, yr, theta_r, xo, yo)
+            v, w = control_potencial_reaching(xr, yr, theta_r, xo, yo)
 
-            # Cinemática diferencial
-            vl, vr = diferencial_inverse_kinematics(
-                v, w, r_rueda, l_eje
-            )
-
+            vl, vr = diferencial_inverse_kinematics(v, w, r_rueda, l_eje)
             enviar_velocidades_udp(
                 mapear_velocidad(vl),
                 mapear_velocidad(vr)
@@ -154,7 +150,7 @@ while True:
         enviar_velocidades_udp(0, 0)
         print("⚠️ Sin detección")
 
-    cv.imshow("Control Reaching the Goal – Marco ArUco 0", frame)
+    cv.imshow("Campos Potenciales + Reaching Goal (Ref ArUco 0)", frame)
     if cv.waitKey(1) & 0xFF == ord('q'):
         break
 
