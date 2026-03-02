@@ -2,6 +2,7 @@ import cv2 as cv
 import cv2.aruco as aruco
 import numpy as np
 import socket
+from collections import defaultdict
 
 # ================= UDP =================
 UDP_IP = "192.168.137.115"
@@ -31,12 +32,17 @@ dist_coeffs = np.array([0.0906, 0.3189, -0.0028, 0.00018, -2.998])
 r_rueda = 0.03
 l_eje = 0.12
 
-# ===== Campos potenciales + reaching goal =====
-kv = 10        # ganancia lineal
-kw = 3.0        # ganancia angular
-v_max = 3    # [m/s]
-w_max = 1    # [rad/s]
-k_r = 0.15    # radio de docking [m]
+# ================= Control =================
+kv = 10
+kw = 3.0
+v_max = 3
+w_max = 1
+k_r = 0.15
+
+# ================= FILTROS =================
+alpha = 0.3
+tvec_filt = defaultdict(lambda: None)
+yaw_filt = defaultdict(lambda: None)
 
 # ================= Funciones =================
 def obtener_matriz_homogenea(rvec, tvec):
@@ -49,49 +55,27 @@ def obtener_matriz_homogenea(rvec, tvec):
 def transformar_a_referencia_0(T_obj, T_ref):
     return np.linalg.inv(T_ref) @ T_obj
 
-def mapear_velocidad(val):
-    return max(-255, min(255, int(val)))
-
 def enviar_velocidades_udp(vl, vr):
-    try:
-        data = f"{vl:.2f},{vr:.2f}".encode()
-        udp_socket.sendto(data, (UDP_IP, UDP_PORT))
-        print(f"Enviado -> vL: {vl:.2f}, vR: {vr:.2f}")
-    except Exception as e:
-        print(f"Error UDP: {e}")
+    data = f"{vl:.2f},{vr:.2f}".encode()
+    udp_socket.sendto(data, (UDP_IP, UDP_PORT))
 
 def diferencial_inverse_kinematics(v, w, r, l):
     vr = (2*v + w*l) / (2*r)
     vl = (2*v - w*l) / (2*r)
     return vl, vr
 
-# ==========================================================
-# CAMPOS POTENCIALES ATRACTIVOS + REACHING GOAL
-# ==========================================================
 def control_potencial_reaching(xr, yr, theta_r, xo, yo):
-
     dx = xo - xr
     dy = yo - yr
     d = np.hypot(dx, dy)
 
-    # Dirección al objetivo
     theta_g = np.arctan2(dy, dx)
-    theta_e = np.arctan2(
-        np.sin(theta_g - theta_r),
-        np.cos(theta_g - theta_r)
-    )
+    theta_e = np.arctan2(np.sin(theta_g-theta_r), np.cos(theta_g-theta_r))
 
-    # ---- Campo atractivo (lineal) ----
-    if d > k_r:
-        v = kv * d
-    else:
-        v = (kv * k_r) * (d / k_r)
-
-    # ---- Campo atractivo angular ----
+    v = kv * min(d, k_r)
     w = kw * np.sin(theta_e)
 
-    # Saturaciones
-    v = np.clip(v, 0.0, v_max)
+    v = np.clip(v, 0, v_max)
     w = np.clip(w, -w_max, w_max)
 
     return v, w
@@ -105,52 +89,65 @@ while True:
     corners, ids, _ = detector.detectMarkers(frame)
 
     if ids is not None:
-        aruco.drawDetectedMarkers(frame, corners, ids)
         rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
-            corners, MARKER_SIZE_METERS,
-            camera_matrix, dist_coeffs
+            corners, MARKER_SIZE_METERS, camera_matrix, dist_coeffs
         )
 
         poses = {}
+
         for i, mid in enumerate(ids.flatten()):
-            poses[mid] = (rvecs[i][0], tvecs[i][0])
-            cv.drawFrameAxes(
-                frame, camera_matrix, dist_coeffs,
-                rvecs[i][0], tvecs[i][0], 0.05
-            )
+            rvec = rvecs[i][0]
+            tvec = tvecs[i][0]
 
-        if all(k in poses for k in [0, 1, 2]):
+            # ===== FILTRO EMA tvec =====
+            if tvec_filt[mid] is None:
+                tvec_filt[mid] = tvec
+            else:
+                tvec_filt[mid] = alpha*tvec + (1-alpha)*tvec_filt[mid]
 
-            T_cam_0 = obtener_matriz_homogenea(*poses[0])
-            T_cam_1 = obtener_matriz_homogenea(*poses[1])
-            T_cam_2 = obtener_matriz_homogenea(*poses[2])
+            # ===== ORIENTACIÓN =====
+            R, _ = cv.Rodrigues(rvec)
+            yaw = np.arctan2(R[1,0], R[0,0])
 
-            T_0_1 = transformar_a_referencia_0(T_cam_1, T_cam_0)
-            T_0_2 = transformar_a_referencia_0(T_cam_2, T_cam_0)
+            if yaw_filt[mid] is None:
+                yaw_filt[mid] = yaw
+            else:
+                yaw_filt[mid] = np.arctan2(
+                    alpha*np.sin(yaw) + (1-alpha)*np.sin(yaw_filt[mid]),
+                    alpha*np.cos(yaw) + (1-alpha)*np.cos(yaw_filt[mid])
+                )
 
-            xr, yr = T_0_1[0, 3], T_0_1[1, 3]
-            xo, yo = T_0_2[0, 3], T_0_2[1, 3]
+            poses[mid] = (rvec, tvec_filt[mid])
 
-            theta_r = np.arctan2(T_0_1[1, 0], T_0_1[0, 0])
+            # ===== DIBUJO =====
+            c = corners[i][0].astype(int)
+            cv.polylines(frame, [c], True, (0,255,0), 2)
+            cx, cy = np.mean(c, axis=0).astype(int)
+            cv.putText(frame, f"ID {mid}", (cx-20, cy-10),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
-            # ===== CONTROL =====
+            cv.drawFrameAxes(frame, camera_matrix, dist_coeffs,
+                             rvec, tvec_filt[mid], 0.05)
+
+        if all(k in poses for k in [0,1,2]):
+            T0 = obtener_matriz_homogenea(*poses[0])
+            T1 = transformar_a_referencia_0(obtener_matriz_homogenea(*poses[1]), T0)
+            T2 = transformar_a_referencia_0(obtener_matriz_homogenea(*poses[2]), T0)
+
+            xr, yr = float(T1[0,3]), float(T1[1,3])
+            xo, yo = float(T2[0,3]), float(T2[1,3])
+            theta_r = yaw_filt[1]
+
             v, w = control_potencial_reaching(xr, yr, theta_r, xo, yo)
-
             vl, vr = diferencial_inverse_kinematics(v, w, r_rueda, l_eje)
-            enviar_velocidades_udp(
-                mapear_velocidad(vl),
-                mapear_velocidad(vr)
-            )
-
+            enviar_velocidades_udp(vl, vr)
         else:
             enviar_velocidades_udp(0, 0)
-            print("⚠️ Faltan marcadores")
 
     else:
         enviar_velocidades_udp(0, 0)
-        print("⚠️ Sin detección")
 
-    cv.imshow("Campos Potenciales + Reaching Goal (Ref ArUco 0)", frame)
+    cv.imshow("Campos Potenciales + ArUco", frame)
     if cv.waitKey(1) & 0xFF == ord('q'):
         break
 
